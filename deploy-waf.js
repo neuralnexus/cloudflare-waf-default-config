@@ -277,17 +277,16 @@ async function createFirewallRule(zoneId, description, expression, priority = 10
           "Authorization": `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
+        body: JSON.stringify([{
           action: "block",
           priority: priority,
           paused: false,
           description: description,
           filter: {
             expression: expression,
-            paused: false,
-            description: description
+            paused: false
           }
-        })
+        }])
       }
     );
     
@@ -316,81 +315,140 @@ function buildPathExpression(paths, type = 'eq') {
   return '';
 }
 
+async function updateFirewallRule(zoneId, ruleId, description, expression, priority) {
+  if (CONFIG.DRY_RUN) {
+    console.log(`    [DRY RUN] Would update rule: ${description}`);
+    return { id: ruleId, description, expression };
+  }
+  
+  try {
+    const response = await fetchWithRetry(
+      `${CONFIG.API_BASE}/zones/${zoneId}/firewall/rules/${ruleId}`,
+      {
+        method: "PUT",
+        headers: {
+          "Authorization": `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          action: "block",
+          priority: priority,
+          paused: false,
+          description: description,
+          filter: {
+            expression: expression,
+            paused: false
+          }
+        })
+      }
+    );
+    
+    const data = await response.json();
+    if (data.success) {
+      console.log(`  🔄 Updated: ${description}`);
+      return data.result;
+    } else {
+      console.error(`  ❌ Failed to update ${description}:`, data.errors);
+      return null;
+    }
+  } catch (error) {
+    console.error(`  ❌ Error updating firewall rule:`, error.message);
+    return null;
+  }
+}
+
 async function deployRulesToDomain(domain, zoneId) {
   console.log(`\n🔒 Deploying WAF rules to ${domain}...`);
   
   try {
-    // Get existing rules with pagination
+    // Get existing rules
     const existingRules = await listFirewallRules(zoneId);
     console.log(`  Found ${existingRules.length} existing firewall rules`);
     
-    // Delete existing "Block" rules created by this script
-    const ourRules = existingRules.filter(r => 
-      r.description && r.description.startsWith("[WAF] ")
+    // Define target rules configuration
+    const targetRules = [
+      {
+        description: "[WAF] Block environment files",
+        expression: buildPathExpression(CRITICAL_PATHS.envFiles, 'eq'),
+        priority: 10
+      },
+      {
+        description: "[WAF] Block sensitive directories", 
+        expression: buildPathExpression(CRITICAL_PATHS.directories, 'starts_with'),
+        priority: 11
+      },
+      {
+        description: "[WAF] Block sensitive files",
+        expression: buildPathExpression(CRITICAL_PATHS.files, 'eq'),
+        priority: 12
+      },
+      {
+        description: "[WAF] Block API and admin endpoints",
+        expression: buildPathExpression(CRITICAL_PATHS.prefixes, 'starts_with'),
+        priority: 13
+      }
+    ].filter(r => r.expression); // Only include rules with non-empty expressions
+    
+    const created = [];
+    const updated = [];
+    const skipped = [];
+    const deleted = [];
+    
+    // Process each target rule
+    for (const target of targetRules) {
+      const existing = existingRules.find(r => 
+        r.description === target.description
+      );
+      
+      if (existing) {
+        // Rule exists - check if expression matches
+        const existingExpr = existing.filter?.expression || existing.expression;
+        if (existingExpr === target.expression && existing.action === 'block') {
+          console.log(`  ⏭️  Skipping (already exists): ${target.description}`);
+          skipped.push(existing);
+        } else {
+          // Expression changed or action different - update it
+          console.log(`  📝 Rule exists but differs, updating: ${target.description}`);
+          const result = await updateFirewallRule(
+            zoneId, 
+            existing.id, 
+            target.description, 
+            target.expression,
+            target.priority
+          );
+          if (result) updated.push(result);
+        }
+      } else {
+        // Rule doesn't exist - create it
+        const result = await createFirewallRule(
+          zoneId,
+          target.description,
+          target.expression,
+          target.priority
+        );
+        if (result) created.push(result);
+      }
+    }
+    
+    // Clean up obsolete [WAF] rules that are no longer in our target list
+    const targetDescriptions = new Set(targetRules.map(r => r.description));
+    const obsoleteRules = existingRules.filter(r => 
+      r.description && 
+      r.description.startsWith("[WAF] ") &&
+      !targetDescriptions.has(r.description)
     );
     
-    for (const rule of ourRules) {
-      console.log(`  🗑️  Removing old rule: ${rule.description}`);
-      await deleteFirewallRule(zoneId, rule.id);
+    for (const rule of obsoleteRules) {
+      console.log(`  🗑️  Removing obsolete rule: ${rule.description}`);
+      const deleted = await deleteFirewallRule(zoneId, rule.id);
+      if (deleted) deleted.push(rule);
     }
     
-    // Create new rules
-    const created = [];
-    let priority = 10;
-    
-    // Rule 1: Block environment files (exact matches)
-    const envExpression = buildPathExpression(CRITICAL_PATHS.envFiles, 'eq');
-    if (envExpression) {
-      const rule = await createFirewallRule(
-        zoneId,
-        "[WAF] Block environment files",
-        envExpression,
-        priority++
-      );
-      if (rule) created.push(rule);
-    }
-    
-    // Rule 2: Block sensitive directories (starts_with)
-    const dirExpression = buildPathExpression(CRITICAL_PATHS.directories, 'starts_with');
-    if (dirExpression) {
-      const rule = await createFirewallRule(
-        zoneId,
-        "[WAF] Block sensitive directories",
-        dirExpression,
-        priority++
-      );
-      if (rule) created.push(rule);
-    }
-    
-    // Rule 3: Block sensitive files (exact matches)
-    const fileExpression = buildPathExpression(CRITICAL_PATHS.files, 'eq');
-    if (fileExpression) {
-      const rule = await createFirewallRule(
-        zoneId,
-        "[WAF] Block sensitive files",
-        fileExpression,
-        priority++
-      );
-      if (rule) created.push(rule);
-    }
-    
-    // Rule 4: Block API/admin prefixes (starts_with)
-    const prefixExpression = buildPathExpression(CRITICAL_PATHS.prefixes, 'starts_with');
-    if (prefixExpression) {
-      const rule = await createFirewallRule(
-        zoneId,
-        "[WAF] Block API and admin endpoints",
-        prefixExpression,
-        priority++
-      );
-      if (rule) created.push(rule);
-    }
-    
-    console.log(`  ✨ Created ${created.length} WAF rules`);
-    return { domain, rules: created.length, error: null };
+    console.log(`  ✨ ${created.length} created, ${updated.length} updated, ${skipped.length} skipped, ${deleted.length} deleted`);
+    return { domain, created: created.length, updated: updated.length, skipped: skipped.length, deleted: deleted.length, error: null };
   } catch (error) {
     console.error(`  ❌ Error deploying to ${domain}:`, error.message);
-    return { domain, rules: 0, error: error.message };
+    return { domain, created: 0, updated: 0, skipped: 0, deleted: 0, error: error.message };
   }
 }
 
@@ -439,14 +497,19 @@ async function main() {
     if (r.error) {
       console.log(`${r.domain}: ❌ ${r.error}`);
     } else {
-      console.log(`${r.domain}: ✅ ${r.rules} rules deployed`);
+      console.log(`${r.domain}: ✅ ${r.created} created, ${r.updated} updated, ${r.skipped} skipped, ${r.deleted} deleted`);
     }
   });
   
   const successCount = results.filter(r => !r.error).length;
   const failCount = results.filter(r => r.error).length;
+  const totalCreated = results.reduce((sum, r) => sum + (r.created || 0), 0);
+  const totalUpdated = results.reduce((sum, r) => sum + (r.updated || 0), 0);
+  const totalSkipped = results.reduce((sum, r) => sum + (r.skipped || 0), 0);
+  const totalDeleted = results.reduce((sum, r) => sum + (r.deleted || 0), 0);
   
   console.log(`\n✨ Done! ${successCount} zones processed successfully, ${failCount} failed.`);
+  console.log(`📈 Totals: ${totalCreated} created, ${totalUpdated} updated, ${totalSkipped} skipped, ${totalDeleted} deleted`);
   
   if (CONFIG.DRY_RUN) {
     console.log("\n🏃 This was a dry run. Set DRY_RUN=false to apply changes.");
