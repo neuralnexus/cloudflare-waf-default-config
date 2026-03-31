@@ -1,0 +1,9 @@
+# Neural Nexus WAF Default Config
+
+node_modules/
+.env
+.env.local
+*.log
+.DS_Store
+.vscode/
+.idea/
