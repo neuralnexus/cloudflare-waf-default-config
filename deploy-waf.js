@@ -65,6 +65,8 @@ async function fetchWithRetry(url, options, attempt = 1) {
 }
 
 async function getAllZones() {
+  const accountFilter = process.env.CLOUDFLARE_ACCOUNT_FILTER;
+  
   try {
     const zones = [];
     let page = 1;
@@ -87,7 +89,9 @@ async function getAllZones() {
           name: z.name, 
           zone_id: z.id,
           status: z.status,
-          paused: z.paused 
+          paused: z.paused,
+          account_name: z.account?.name,
+          account_id: z.account?.id
         })));
         
         hasMore = data.result_info.total_pages > page;
@@ -97,8 +101,29 @@ async function getAllZones() {
       }
     }
     
-    // Filter to only active, unpaused zones
-    return zones.filter(z => z.status === "active" && !z.paused);
+    // Filter to only active zones, and account if specified
+    const filteredZones = zones.filter(z => {
+      const isActive = z.status === "active" && !z.paused;
+      
+      if (accountFilter && isActive) {
+        const filterLower = accountFilter.toLowerCase();
+        const accountLower = (z.account_name || '').toLowerCase();
+        const isMatchingAccount = accountLower.includes(filterLower);
+        
+        if (!isMatchingAccount) {
+          console.log(`  ⚠️  Skipping ${z.name} (account: ${z.account_name})`);
+        }
+        return isMatchingAccount;
+      }
+      
+      return isActive;
+    });
+    
+    if (accountFilter) {
+      console.log(`  Filtered to ${filteredZones.length} zones from account matching "${accountFilter}"`);
+    }
+    
+    return filteredZones;
   } catch (error) {
     console.error("❌ Error fetching zones:", error.message);
     return [];
