@@ -16,8 +16,8 @@ This provides a simple baseline security layer across all your domains automatic
 ## Requirements
 
 Cloudflare API Token with:
-- `Zone:Read` - to list your zones
-- `Zone:Firewall Rules:Edit` - to create rules
+- `Zone:Zone:Read` - to list your zones
+- `Zone:Firewall Rules:Edit` - to create and edit firewall rules
 
 Create one at: https://dash.cloudflare.com/profile/api-tokens
 
