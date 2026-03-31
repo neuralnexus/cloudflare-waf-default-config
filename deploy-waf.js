@@ -5,6 +5,65 @@
  * Compatible with Cloudflare Free Plan (up to 5 firewall rules per zone)
  */
 
+// Configuration
+const CONFIG = {
+  DRY_RUN: process.env.DRY_RUN === 'true',
+  MAX_RETRIES: 3,
+  RETRY_DELAY: 1000,
+  REQUESTS_PER_SECOND: 4,
+  API_BASE: 'https://api.cloudflare.com/client/v4',
+};
+
+// Rate limiting queue
+class RateLimiter {
+  constructor(requestsPerSecond) {
+    this.interval = 1000 / requestsPerSecond;
+    this.lastRequest = 0;
+  }
+
+  async wait() {
+    const now = Date.now();
+    const elapsed = now - this.lastRequest;
+    if (elapsed < this.interval) {
+      await sleep(this.interval - elapsed);
+    }
+    this.lastRequest = Date.now();
+  }
+}
+
+const rateLimiter = new RateLimiter(CONFIG.REQUESTS_PER_SECOND);
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(url, options, attempt = 1) {
+  await rateLimiter.wait();
+  
+  try {
+    const response = await fetch(url, options);
+    
+    // Handle rate limiting
+    if (response.status === 429) {
+      const retryAfter = response.headers.get('retry-after') || 5;
+      console.log(`  ⏳ Rate limited. Waiting ${retryAfter}s before retry...`);
+      await sleep(retryAfter * 1000);
+      if (attempt < CONFIG.MAX_RETRIES) {
+        return fetchWithRetry(url, options, attempt + 1);
+      }
+    }
+    
+    return response;
+  } catch (error) {
+    if (attempt < CONFIG.MAX_RETRIES) {
+      console.log(`  🔄 Retrying... (${attempt}/${CONFIG.MAX_RETRIES})`);
+      await sleep(CONFIG.RETRY_DELAY * attempt);
+      return fetchWithRetry(url, options, attempt + 1);
+    }
+    throw error;
+  }
+}
+
 async function getAllZones() {
   try {
     const zones = [];
@@ -12,8 +71,8 @@ async function getAllZones() {
     let hasMore = true;
     
     while (hasMore) {
-      const response = await fetch(
-        `https://api.cloudflare.com/client/v4/zones?page=${page}&per_page=50`,
+      const response = await fetchWithRetry(
+        `${CONFIG.API_BASE}/zones?page=${page}&per_page=50`,
         {
           headers: {
             "Authorization": `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
@@ -47,146 +106,106 @@ async function getAllZones() {
 }
 
 // Priority paths to block (most critical - reduces list to fit free tier limits)
-const CRITICAL_PATHS = [
-  // Environment files
-  "/.env",
-  "/.env.local",
-  "/.env.production",
-  "/.env.dev",
-  "/.envrc",
-  "/.config",
-  
-  // Git repositories
-  "/.git",
-  "/.git/config",
-  "/.git/head",
-  "/.git/logs",
-  
-  // Credentials and keys
-  "/.aws",
-  "/.ssh",
-  "/id_rsa",
-  "/id_dsa",
-  "/.htpasswd",
-  
-  // Config files with secrets
-  "/config.json",
-  "/config.php",
-  "/appsettings.json",
-  "/credentials.json",
-  
-  // Database dumps
-  "/dump.sql",
-  "/database.sql",
-  "/backup.sql",
-  
-  // Admin panels
-  "/admin",
-  "/admin/",
-  "/adminer.php",
-  "/phpmyadmin",
-  "/phpMyAdmin",
-  
-  // Debug endpoints
-  "/debug",
-  "/debug/",
-  "/actuator",
-  "/actuator/",
-  "/trace.axd",
-  
-  // Source map files (can leak source code)
-  "/bundle.js.map",
-  "/app.js.map",
-  
-  // Common backup files
-  "/backup",
-  "/backup.zip",
-  "/backup.tar.gz",
-  
-  // Docker
-  "/docker-compose.yml",
-  "/docker-compose.yaml",
-  "/Dockerfile",
-  
-  // Package managers
-  "/package.json",
-  "/composer.json",
-  "/composer.lock",
-  
-  // CI/CD configs
-  "/.github/workflows",
-  
-  // IDE files
-  "/.idea",
-  "/.vscode",
-  
-  // Log files
-  "/error.log",
-  "/access.log",
-  "/debug.log",
-  
-  // XML files that may contain configs
-  "/web.config",
-  "/.htaccess",
-];
-
-// API endpoints to block
-const SENSITIVE_API_PATTERNS = [
-  "/api/admin",
-  "/api/debug",
-  "/api/config",
-  "/api/keys",
-  "/api/secrets",
-  "/api/internal",
-  "/graphql/v1",
-  "/swagger-ui",
-  "/swagger.json",
-  "/api-docs",
-  "/openapi.json",
-  "/actuator/env",
-  "/actuator/configprops",
-  "/actuator/heapdump",
-  "/heapdump",
-  "/jolokia",
-];
-
-async function getZoneId(domain) {
-  try {
-    const response = await fetch(
-      `https://api.cloudflare.com/client/v4/zones?name=${encodeURIComponent(domain)}`,
-      {
-        headers: {
-          "Authorization": `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
-    
-    const data = await response.json();
-    if (data.success && data.result.length > 0) {
-      return data.result[0].id;
-    }
-    throw new Error(`Zone not found for ${domain}`);
-  } catch (error) {
-    console.error(`❌ Error fetching zone for ${domain}:`, error.message);
-    return null;
-  }
-}
+// Using starts_with for directories and eq for exact matches to avoid false positives
+const CRITICAL_PATHS = {
+  // Environment files - exact match
+  envFiles: [
+    '/.env',
+    '/.env.local',
+    '/.env.production',
+    '/.env.dev',
+    '/.envrc',
+  ],
+  // Directories - starts_with
+  directories: [
+    '/.git/',
+    '/.aws/',
+    '/.ssh/',
+    '/.config/',
+    '/.github/',
+    '/.idea/',
+    '/.vscode/',
+  ],
+  // Specific files - exact match
+  files: [
+    '/id_rsa',
+    '/id_dsa',
+    '/.htpasswd',
+    '/config.json',
+    '/config.php',
+    '/appsettings.json',
+    '/credentials.json',
+    '/dump.sql',
+    '/database.sql',
+    '/backup.sql',
+    '/adminer.php',
+    '/phpmyadmin',
+    '/phpMyAdmin',
+    '/trace.axd',
+    '/bundle.js.map',
+    '/app.js.map',
+    '/docker-compose.yml',
+    '/docker-compose.yaml',
+    '/Dockerfile',
+    '/package.json',
+    '/composer.json',
+    '/composer.lock',
+    '/error.log',
+    '/access.log',
+    '/debug.log',
+    '/web.config',
+    '/.htaccess',
+  ],
+  // Path prefixes - starts_with (more specific than contains)
+  prefixes: [
+    '/admin/',
+    '/debug/',
+    '/actuator/',
+    '/api/admin/',
+    '/api/debug/',
+    '/api/config/',
+    '/api/keys/',
+    '/api/secrets/',
+    '/api/internal/',
+    '/graphql/v1/',
+    '/swagger-ui',
+    '/api-docs',
+    '/actuator/env',
+    '/actuator/configprops',
+    '/actuator/heapdump',
+    '/heapdump',
+    '/jolokia',
+  ],
+};
 
 async function listFirewallRules(zoneId) {
   try {
-    const response = await fetch(
-      `https://api.cloudflare.com/client/v4/zones/${zoneId}/firewall/rules`,
-      {
-        headers: {
-          "Authorization": `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
+    const allRules = [];
+    let page = 1;
+    let hasMore = true;
     
-    const data = await response.json();
-    return data.success ? data.result : [];
+    while (hasMore) {
+      const response = await fetchWithRetry(
+        `${CONFIG.API_BASE}/zones/${zoneId}/firewall/rules?page=${page}&per_page=50`,
+        {
+          headers: {
+            "Authorization": `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
+            "Content-Type": "application/json"
+          }
+        }
+      );
+      
+      const data = await response.json();
+      if (data.success && data.result) {
+        allRules.push(...data.result);
+        hasMore = data.result_info.total_pages > page;
+        page++;
+      } else {
+        hasMore = false;
+      }
+    }
+    
+    return allRules;
   } catch (error) {
     console.error(`❌ Error listing firewall rules:`, error.message);
     return [];
@@ -194,9 +213,14 @@ async function listFirewallRules(zoneId) {
 }
 
 async function deleteFirewallRule(zoneId, ruleId) {
+  if (CONFIG.DRY_RUN) {
+    console.log(`    [DRY RUN] Would delete rule: ${ruleId}`);
+    return true;
+  }
+  
   try {
-    const response = await fetch(
-      `https://api.cloudflare.com/client/v4/zones/${zoneId}/firewall/rules/${ruleId}`,
+    const response = await fetchWithRetry(
+      `${CONFIG.API_BASE}/zones/${zoneId}/firewall/rules/${ruleId}`,
       {
         method: "DELETE",
         headers: {
@@ -213,10 +237,15 @@ async function deleteFirewallRule(zoneId, ruleId) {
   }
 }
 
-async function createFirewallRule(zoneId, description, expression) {
+async function createFirewallRule(zoneId, description, expression, priority = 10) {
+  if (CONFIG.DRY_RUN) {
+    console.log(`    [DRY RUN] Would create rule: ${description}`);
+    return { id: 'dry-run', description, expression };
+  }
+  
   try {
-    const response = await fetch(
-      `https://api.cloudflare.com/client/v4/zones/${zoneId}/firewall/rules`,
+    const response = await fetchWithRetry(
+      `${CONFIG.API_BASE}/zones/${zoneId}/firewall/rules`,
       {
         method: "POST",
         headers: {
@@ -225,7 +254,7 @@ async function createFirewallRule(zoneId, description, expression) {
         },
         body: JSON.stringify({
           action: "block",
-          priority: 10,
+          priority: priority,
           paused: false,
           description: description,
           filter: {
@@ -251,91 +280,101 @@ async function createFirewallRule(zoneId, description, expression) {
   }
 }
 
-function buildPathExpression(paths) {
-  // Group paths to avoid extremely long expressions
-  // Cloudflare firewall rules have expression length limits
-  const expressions = paths.map(path => `http.request.uri.path contains "${path}"`);
-  return expressions.join(" or ");
+function buildPathExpression(paths, type = 'eq') {
+  if (type === 'eq') {
+    return paths.map(path => `http.request.uri.path eq "${path}"`).join(' or ');
+  } else if (type === 'starts_with') {
+    return paths.map(path => `starts_with(http.request.uri.path, "${path}")`).join(' or ');
+  } else if (type === 'ends_with') {
+    return paths.map(path => `ends_with(http.request.uri.path, "${path}")`).join(' or ');
+  }
+  return '';
 }
 
 async function deployRulesToDomain(domain, zoneId) {
   console.log(`\n🔒 Deploying WAF rules to ${domain}...`);
   
-  // Get existing rules
-  const existingRules = await listFirewallRules(zoneId);
-  console.log(`  Found ${existingRules.length} existing firewall rules`);
-  
-  // Delete existing "Block" rules created by this script
-  const ourRules = existingRules.filter(r => 
-    r.description && r.description.startsWith("[WAF] ")
-  );
-  
-  for (const rule of ourRules) {
-    console.log(`  🗑️  Removing old rule: ${rule.description}`);
-    await deleteFirewallRule(zoneId, rule.id);
-  }
-  
-  // Create new rules
-  const created = [];
-  
-  // Rule 1: Block environment files and credentials
-  const envExpression = CRITICAL_PATHS
-    .filter(p => p.includes(".env") || p.includes("credentials") || p.includes("config") || p.includes(".aws") || p.includes(".ssh"))
-    .slice(0, 20) // Limit to avoid expression too long
-    .map(p => `http.request.uri.path contains "${p}"`)
-    .join(" or ");
+  try {
+    // Get existing rules with pagination
+    const existingRules = await listFirewallRules(zoneId);
+    console.log(`  Found ${existingRules.length} existing firewall rules`);
     
-  if (envExpression) {
-    const rule = await createFirewallRule(
-      zoneId,
-      "[WAF] Block environment files and credentials",
-      envExpression
+    // Delete existing "Block" rules created by this script
+    const ourRules = existingRules.filter(r => 
+      r.description && r.description.startsWith("[WAF] ")
     );
-    if (rule) created.push(rule);
+    
+    for (const rule of ourRules) {
+      console.log(`  🗑️  Removing old rule: ${rule.description}`);
+      await deleteFirewallRule(zoneId, rule.id);
+    }
+    
+    // Create new rules
+    const created = [];
+    let priority = 10;
+    
+    // Rule 1: Block environment files (exact matches)
+    const envExpression = buildPathExpression(CRITICAL_PATHS.envFiles, 'eq');
+    if (envExpression) {
+      const rule = await createFirewallRule(
+        zoneId,
+        "[WAF] Block environment files",
+        envExpression,
+        priority++
+      );
+      if (rule) created.push(rule);
+    }
+    
+    // Rule 2: Block sensitive directories (starts_with)
+    const dirExpression = buildPathExpression(CRITICAL_PATHS.directories, 'starts_with');
+    if (dirExpression) {
+      const rule = await createFirewallRule(
+        zoneId,
+        "[WAF] Block sensitive directories",
+        dirExpression,
+        priority++
+      );
+      if (rule) created.push(rule);
+    }
+    
+    // Rule 3: Block sensitive files (exact matches)
+    const fileExpression = buildPathExpression(CRITICAL_PATHS.files, 'eq');
+    if (fileExpression) {
+      const rule = await createFirewallRule(
+        zoneId,
+        "[WAF] Block sensitive files",
+        fileExpression,
+        priority++
+      );
+      if (rule) created.push(rule);
+    }
+    
+    // Rule 4: Block API/admin prefixes (starts_with)
+    const prefixExpression = buildPathExpression(CRITICAL_PATHS.prefixes, 'starts_with');
+    if (prefixExpression) {
+      const rule = await createFirewallRule(
+        zoneId,
+        "[WAF] Block API and admin endpoints",
+        prefixExpression,
+        priority++
+      );
+      if (rule) created.push(rule);
+    }
+    
+    console.log(`  ✨ Created ${created.length} WAF rules`);
+    return { domain, rules: created.length, error: null };
+  } catch (error) {
+    console.error(`  ❌ Error deploying to ${domain}:`, error.message);
+    return { domain, rules: 0, error: error.message };
   }
-  
-  // Rule 2: Block Git repository access
-  const gitExpression = `(http.request.uri.path contains "/.git/" or http.request.uri.path contains ".gitignore")`;
-  const gitRule = await createFirewallRule(
-    zoneId,
-    "[WAF] Block Git repository access",
-    gitExpression
-  );
-  if (gitRule) created.push(gitRule);
-  
-  // Rule 3: Block admin panels
-  const adminExpression = `(http.request.uri.path contains "/admin" or http.request.uri.path contains "adminer.php" or http.request.uri.path contains "phpmyadmin" or http.request.uri.path contains "phpMyAdmin")`;
-  const adminRule = await createFirewallRule(
-    zoneId,
-    "[WAF] Block admin panel access",
-    adminExpression
-  );
-  if (adminRule) created.push(adminRule);
-  
-  // Rule 4: Block debug and actuator endpoints
-  const debugExpression = `(http.request.uri.path contains "/debug" or http.request.uri.path contains "/actuator" or http.request.uri.path contains "heapdump" or http.request.uri.path contains "jolokia" or http.request.uri.path contains "trace.axd")`;
-  const debugRule = await createFirewallRule(
-    zoneId,
-    "[WAF] Block debug endpoints",
-    debugExpression
-  );
-  if (debugRule) created.push(debugRule);
-  
-  // Rule 5: Block database dumps and backups
-  const dbExpression = `(http.request.uri.path contains ".sql" or http.request.uri.path contains "dump" or http.request.uri.path contains "backup" or http.request.uri.path contains "database")`;
-  const dbRule = await createFirewallRule(
-    zoneId,
-    "[WAF] Block database dumps and backups",
-    dbExpression
-  );
-  if (dbRule) created.push(dbRule);
-  
-  console.log(`  ✨ Created ${created.length} WAF rules`);
-  return created;
 }
 
 async function main() {
   console.log("🛡️  Cloudflare WAF Rule Deployment\n");
+  
+  if (CONFIG.DRY_RUN) {
+    console.log("🏃 DRY RUN MODE - No changes will be made\n");
+  }
   
   if (!process.env.CLOUDFLARE_API_TOKEN) {
     console.error("❌ CLOUDFLARE_API_TOKEN environment variable is required");
@@ -344,6 +383,7 @@ async function main() {
     console.log("2. Create a token with these permissions:");
     console.log("   - Zone:Read, Firewall Rules:Edit");
     console.log("   - Include all zones or specific zones");
+    console.log("\nSet DRY_RUN=true to preview changes without applying them.");
     process.exit(1);
   }
   
@@ -358,14 +398,14 @@ async function main() {
   console.log(`Found ${zones.length} active zones:\n`);
   zones.forEach(z => console.log(`  • ${z.name}`));
   
-  console.log("\n⚠️  This script will create up to 5 firewall rules per zone (Free Plan limit)");
+  console.log("\n⚠️  This script will create up to 4 firewall rules per zone");
   console.log("Rules will block access to sensitive paths and endpoints.\n");
   
   const results = [];
   
   for (const zone of zones) {
-    const rules = await deployRulesToDomain(zone.name, zone.zone_id);
-    results.push({ domain: zone.name, rules: rules.length });
+    const result = await deployRulesToDomain(zone.name, zone.zone_id);
+    results.push(result);
   }
   
   console.log("\n📊 Deployment Summary:");
@@ -378,13 +418,21 @@ async function main() {
     }
   });
   
-  console.log("\n✨ Done! WAF protection is now active on your domains.");
-  console.log("\nNote: Changes may take 30-60 seconds to propagate globally.");
-  console.log("\nTo verify rules are working:");
-  console.log("  curl -I https://your-domain/.env");
-  console.log("  curl -I https://your-domain/.git/config");
-  console.log("  curl -I https://your-domain/admin");
-  console.log("\nAll should return HTTP 403 Forbidden.");
+  const successCount = results.filter(r => !r.error).length;
+  const failCount = results.filter(r => r.error).length;
+  
+  console.log(`\n✨ Done! ${successCount} zones processed successfully, ${failCount} failed.`);
+  
+  if (CONFIG.DRY_RUN) {
+    console.log("\n🏃 This was a dry run. Set DRY_RUN=false to apply changes.");
+  } else {
+    console.log("\nNote: Changes may take 30-60 seconds to propagate globally.");
+    console.log("\nTo verify rules are working:");
+    console.log("  curl -I https://your-domain/.env");
+    console.log("  curl -I https://your-domain/.git/config");
+    console.log("  curl -I https://your-domain/admin");
+    console.log("\nAll should return HTTP 403 Forbidden.");
+  }
 }
 
 main().catch(error => {
