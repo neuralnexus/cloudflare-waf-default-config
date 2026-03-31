@@ -50,6 +50,18 @@ export CLOUDFLARE_API_TOKEN="your_token"
 node deploy-waf.js
 ```
 
+### Filter by Account
+
+If your API token has access to multiple accounts, you can filter to a specific account:
+
+```bash
+export CLOUDFLARE_API_TOKEN="your_token"
+export CLOUDFLARE_ACCOUNT_FILTER="your_email_or_name"
+node deploy-waf.js
+```
+
+The filter matches any account name containing the filter string (case-insensitive).
+
 The script discovers all active zones in your account and deploys 4 firewall rules to each.
 
 ## What Gets Blocked
